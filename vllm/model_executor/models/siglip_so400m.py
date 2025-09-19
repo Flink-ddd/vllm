@@ -2,20 +2,23 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
-import sys
-import typing
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import torch
+import typing
 from PIL import Image
 from torch import nn
 from transformers import (BatchFeature, SiglipImageProcessor, SiglipProcessor,
                           SiglipTextConfig, SiglipTokenizer,
                           SiglipVisionConfig)
 
+from vllm.attention.layer import MultiHeadAttention
 from vllm.config import VllmConfig
-from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.model_executor.layers.linear import (ColumnParallelLinear,
+                                               QKVParallelLinear,
+                                               RowParallelLinear)
 from vllm.model_executor.layers.pooler import DispatchPooler, Pooler
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -26,14 +29,13 @@ from vllm.multimodal.inputs import (MultiModalDataDict, MultiModalFieldConfig,
                                     MultiModalKwargs)
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.multimodal.processing import (BaseMultiModalProcessor,
-                                        PromptIndexTargets, PromptInsertion,
-                                        PromptUpdate)
+                                        BaseProcessingInfo, PromptInsertion,
+                                        PromptIndexTargets, PromptUpdate)
 from vllm.multimodal.profiling import BaseDummyInputsBuilder
 
-from .idefics2_vision_model import (Idefics2VisionAttention,
-                                    Idefics2VisionEmbeddings,
+from .idefics2_vision_model import (Idefics2VisionEmbeddings,
                                     Idefics2VisionMLP)
-from .interfaces import SupportsMultiModal, default_pooling_type
+from .interfaces import SupportsMultiModal
 from .siglip import SiglipEncoderInfo
 from .utils import WeightsMapper
 
@@ -42,25 +44,29 @@ if typing.TYPE_CHECKING:
     from vllm.multimodal.utils import PlaceholderFeaturesInfo
 
 
-class SiglipSo400mProcessingInfo(SiglipEncoderInfo):
+class SiglipSo400mProcessingInfo(SiglipEncoderInfo, BaseProcessingInfo):
 
     def __init__(self, ctx: "InputProcessingContext") -> None:
-        self.ctx = ctx
-        self.model_id = ctx.model_config.model
+        # 最终修复：
+        # 1. 只调用功能正常的 BaseProcessingInfo 的 __init__ 方法。
+        BaseProcessingInfo.__init__(self, ctx)
+
+        # 2. 不再调用有问题的 SiglipEncoderInfo.__init__()。
+        #    我们手动设置它所需要的属性即可。
         hf_config = ctx.get_hf_config()
-        self.hf_config = hf_config
         self.vision_config = hf_config.vision_config
+        self.hf_config = hf_config
+
+        # 3. 设置我们自己类需要的其他属性。
+        # self.model_id = ctx.model_config.model
 
     def get_hf_processor(self, **kwargs: Any) -> SiglipProcessor:
-        vision_config = self.hf_config
-        if hasattr(vision_config, "vision_config"):
-            vision_config = vision_config.vision_config
-        image_processor = SiglipImageProcessor(size={
-            "height":
-            vision_config.image_size,
-            "width":
-            vision_config.image_size
-        }, )
+        vision_config = self.hf_config.vision_config
+        image_processor = SiglipImageProcessor(
+            size={
+                "height": vision_config.image_size,
+                "width": vision_config.image_size
+            }, )
         tokenizer_path = self.ctx.model_config.tokenizer
         tokenizer = SiglipTokenizer.from_pretrained(tokenizer_path, **kwargs)
         return SiglipProcessor(image_processor=image_processor,
@@ -69,11 +75,8 @@ class SiglipSo400mProcessingInfo(SiglipEncoderInfo):
     def get_tokenizer(self) -> SiglipTokenizer:
         return self.get_hf_processor().tokenizer
 
-    def get_allowed_mm_limits(self) -> Mapping[str, Optional[int]]:
-        return {"image": sys.maxsize}
-
     def get_supported_mm_limits(self) -> Mapping[str, Optional[int]]:
-        return {"image": sys.maxsize}
+        return {"image": None}
 
     def get_mm_max_tokens_per_item(
         self,
@@ -164,9 +167,6 @@ class SiglipSo400mMultiModalProcessor(
         pass
 
     def _process_image(self, images: list[Image.Image]) -> MultiModalDataDict:
-        # This method provides custom batching for the NaViT model to handle
-        # variable-sized images. It dynamically pads images to a uniform size
-        # and generates a patch_attention_mask to ignore the padded areas.
         processor: SiglipImageProcessor = self.info.get_hf_processor(
         ).image_processor
         patch_size = self.info.get_patch_size()
@@ -205,43 +205,110 @@ class SiglipSo400mMultiModalProcessor(
         })
 
 
-class SiglipAttention(Idefics2VisionAttention):
+class SiglipBaseAttention(nn.Module):
+    """Base attention module for Siglip with common initialization."""
 
-    def __init__(self,
-                 config,
-                 quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
-        super().__init__(config=config,
-                         quant_config=quant_config,
-                         prefix=prefix)
+    def __init__(
+        self,
+        config: Union[SiglipVisionConfig, SiglipTextConfig],
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        if self.head_dim * self.num_heads != self.hidden_size:
+            raise ValueError(
+                f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size} and `num_heads`: {self.num_heads})."  # noqa
+            )
+        self.scale = self.head_dim**-0.5
+        tp_size = get_tensor_model_parallel_world_size()
+        self.num_heads_per_partition = self.num_heads // tp_size
+        self.qkv_proj = QKVParallelLinear(self.hidden_size,
+                                          self.head_dim,
+                                          self.num_heads,
+                                          bias=True,
+                                          quant_config=quant_config,
+                                          prefix=f"{prefix}.qkv_proj")
+        self.out_proj = RowParallelLinear(self.hidden_size,
+                                          self.hidden_size,
+                                          bias=True,
+                                          quant_config=quant_config,
+                                          prefix=f"{prefix}.out_proj")
+        self.attn = MultiHeadAttention(num_heads=self.num_heads_per_partition,
+                                       head_size=self.head_dim,
+                                       scale=self.scale)
+
+
+class SiglipVisionAttention(SiglipBaseAttention):
+    """Vision-specific attention that does not handle an attention mask."""
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
+        query, key, value = qkv.chunk(3, dim=-1)
+        attn_output = self.attn(query, key, value)
+        output, _ = self.out_proj(attn_output)
+        return output
+
+
+class SiglipTextAttention(SiglipBaseAttention):
+    """Text-specific attention that handles an attention mask."""
 
     def forward(self,
                 hidden_states: torch.Tensor,
                 attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        query_states, key_states, value_states = qkv.chunk(3, dim=-1)
-
-        attn_output = self.attn(query_states,
-                                key_states,
-                                value_states,
-                                attn_bias=attention_mask)
-
-        attn_output, _ = self.out_proj(attn_output)
-        return attn_output
+        query, key, value = qkv.chunk(3, dim=-1)
+        attn_output = self.attn(query, key, value, attn_mask=attention_mask)
+        output, _ = self.out_proj(attn_output)
+        return output
 
 
-class SiglipEncoderLayer(nn.Module):
+class SiglipVisionEncoderLayer(nn.Module):
+    """Encoder layer for the Vision Tower."""
 
     def __init__(self,
-                 config,
+                 config: SiglipVisionConfig,
                  quant_config: Optional[QuantizationConfig] = None,
                  prefix: str = ""):
         super().__init__()
         self.layer_norm1 = nn.LayerNorm(config.hidden_size,
                                         eps=config.layer_norm_eps)
-        self.self_attn = SiglipAttention(config,
-                                         quant_config=quant_config,
-                                         prefix=f"{prefix}.self_attn")
+        self.self_attn = SiglipVisionAttention(config,
+                                               quant_config=quant_config,
+                                               prefix=f"{prefix}.self_attn")
+        self.layer_norm2 = nn.LayerNorm(config.hidden_size,
+                                        eps=config.layer_norm_eps)
+        self.mlp = Idefics2VisionMLP(config,
+                                     quant_config=quant_config,
+                                     prefix=f"{prefix}.mlp")
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.layer_norm1(hidden_states)
+        hidden_states = self.self_attn(hidden_states)
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.layer_norm2(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+        return hidden_states
+
+
+class SiglipTextEncoderLayer(nn.Module):
+    """Encoder layer for the Text Tower."""
+
+    def __init__(self,
+                 config: SiglipTextConfig,
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = ""):
+        super().__init__()
+        self.layer_norm1 = nn.LayerNorm(config.hidden_size,
+                                        eps=config.layer_norm_eps)
+        self.self_attn = SiglipTextAttention(config,
+                                             quant_config=quant_config,
+                                             prefix=f"{prefix}.self_attn")
         self.layer_norm2 = nn.LayerNorm(config.hidden_size,
                                         eps=config.layer_norm_eps)
         self.mlp = Idefics2VisionMLP(config,
@@ -253,13 +320,31 @@ class SiglipEncoderLayer(nn.Module):
                 attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.layer_norm1(hidden_states)
-        hidden_states = self.self_attn(hidden_states, attention_mask)
+        hidden_states = self.self_attn(hidden_states,
+                                      attention_mask=attention_mask)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.layer_norm2(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
+
+
+class SiglipEncoder(nn.Module):
+    """A generic Transformer encoder that can create vision or text layers."""
+
+    def __init__(self,
+                 config: Union[SiglipVisionConfig, SiglipTextConfig],
+                 quant_config: Optional[QuantizationConfig],
+                 prefix: str,
+                 is_vision: bool):
+        super().__init__()
+        LayerClass = (SiglipVisionEncoderLayer
+                      if is_vision else SiglipTextEncoderLayer)
+        self.layers = nn.ModuleList([
+            LayerClass(config, quant_config, prefix=f"{prefix}.layers.{i}")
+            for i in range(config.num_hidden_layers)
+        ])
 
 
 class SiglipNavitVisionEmbeddings(Idefics2VisionEmbeddings):
@@ -310,7 +395,7 @@ class SiglipMultiheadAttentionPoolingHead(nn.Module):
                                           key_padding_mask=key_padding_mask)
         residual = pooled_output
         pooled_output = self.layernorm(pooled_output)
-        mlp_output, _ = self.mlp(pooled_output)
+        mlp_output = self.mlp(pooled_output)
         pooled_output = residual + mlp_output
         final_output = pooled_output[:, 0]
         return final_output
@@ -327,7 +412,8 @@ class SiglipVisionTower(nn.Module):
         self.embeddings = SiglipNavitVisionEmbeddings(config)
         self.encoder = SiglipEncoder(config,
                                      quant_config,
-                                     prefix=f"{prefix}.encoder")
+                                     prefix=f"{prefix}.encoder",
+                                     is_vision=True)
         self.post_layernorm = nn.LayerNorm(config.hidden_size,
                                            eps=config.layer_norm_eps)
         self.head = SiglipMultiheadAttentionPoolingHead(
@@ -337,7 +423,7 @@ class SiglipVisionTower(nn.Module):
                 patch_attention_mask: torch.Tensor) -> torch.Tensor:
         x = self.embeddings(pixel_values, patch_attention_mask)
         for layer in self.encoder.layers:
-            x = layer(x, attention_mask=None)
+            x = layer(x)
         x = self.post_layernorm(x)
         return x
 
@@ -372,18 +458,6 @@ class SiglipTextEmbeddings(nn.Module):
         return embeddings
 
 
-class SiglipEncoder(nn.Module):
-
-    def __init__(self, config, quant_config, prefix):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            SiglipEncoderLayer(config,
-                               quant_config,
-                               prefix=f"{prefix}.layers.{i}")
-            for i in range(config.num_hidden_layers)
-        ])
-
-
 class SiglipTextTower(nn.Module):
 
     def __init__(self,
@@ -395,7 +469,8 @@ class SiglipTextTower(nn.Module):
         self.embeddings = SiglipTextEmbeddings(config)
         self.encoder = SiglipEncoder(config,
                                      quant_config,
-                                     prefix=f"{prefix}.encoder")
+                                     prefix=f"{prefix}.encoder",
+                                     is_vision=False)
         self.final_layer_norm = nn.LayerNorm(config.hidden_size,
                                              eps=config.layer_norm_eps)
         projection_size = getattr(config, 'projection_size',
@@ -431,9 +506,9 @@ class SiglipTextTower(nn.Module):
     info=SiglipSo400mProcessingInfo,
     dummy_inputs=SiglipSo400mDummyInputsBuilder,
 )
-@default_pooling_type("ALL")
 class SiglipSo400mModel(nn.Module, SupportsMultiModal):
     is_pooling_model = True
+    default_pooling_type = "ALL"
     hf_to_vllm_mapper = WeightsMapper(orig_to_new_prefix={
         "text_model.": "text_tower.",
         "vision_model.": "vision_tower.",
@@ -462,10 +537,10 @@ class SiglipSo400mModel(nn.Module, SupportsMultiModal):
             {"encode": Pooler.for_encode(pooler_config)})
 
     def get_multimodal_embeddings(
-            self, **kwargs: object) -> SiglipNavitVisionEmbeddings:
+            self, **kwargs: object) -> torch.Tensor:
         image_input = self._parse_and_validate_image_input(**kwargs)
         if image_input is None:
-            return []
+            return torch.empty(0)
         vision_embeddings = self._process_image_input(image_input)
         return vision_embeddings
 

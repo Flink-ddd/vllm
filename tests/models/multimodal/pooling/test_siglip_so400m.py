@@ -1,72 +1,139 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Optional
-
 import pytest
 import torch
 import torch.nn.functional as F
+from transformers import SiglipModel, SiglipProcessor
 
-from vllm.entrypoints.llm import LLM
-from vllm.inputs import TextPrompt
-from vllm.model_executor.utils import set_random_seed
-
-from ....conftest import VllmRunner
+from ....conftest import HfRunner, VllmRunner
+from ...utils import check_embeddings_close
 
 MODEL = "HuggingFaceM4/siglip-so400m-14-980-flash-attn2-navit"
 TOKENIZER_ID = "google/siglip-base-patch16-224"
 
 
-def encode_multimodal(llm: LLM, prompts: Optional[list[Optional[str]]],
-                      images: Optional[list[Optional[str]]]):
-    batch_size = 0
-    if prompts is not None:
-        batch_size = len(prompts)
-    elif images is not None:
-        batch_size = len(images)
-    else:
-        return []
+def _run_test(
+    hf_runner: type[HfRunner],
+    vllm_runner: type[VllmRunner],
+    model: str,
+    dtype: str,
+    *,
+    input_texts: list[str],
+    input_images: list["Image.Image"],
+) -> None:
+    """
+    A centralized function to run tests. It executes vLLM, then Hugging Face,
+    and compares their embedding outputs.
+    """
+    with vllm_runner(model,
+                     runner="pooling",
+                     dtype=dtype,
+                     enforce_eager=True,
+                     trust_remote_code=True,
+                     max_model_len=64,
+                     tokenizer_name=TOKENIZER_ID,
+                     gpu_memory_utilization=0.8) as vllm_model:
+        vllm_outputs = vllm_model.embed(input_texts, images=input_images)
 
-    inputs = []
-    for i in range(batch_size):
-        prompt_text = prompts[i] if prompts and prompts[i] is not None else ""
-        image_data = images[i] if images else None
+    with hf_runner(model, dtype=dtype) as hf_model:
+        inputs = hf_model.get_inputs(input_texts, images=input_images)
+        hf_inputs = hf_model.wrap_device(inputs)
 
-        inputs.append(
-            TextPrompt(prompt=prompt_text,
-                       multi_modal_data={'image': image_data}
-                       if image_data else None))
+        with torch.no_grad():
+            if input_images and input_texts and all(input_texts):
+                # Both image and text inputs
+                 hf_image_embeds = hf_model.model.get_image_features(
+                    pixel_values=hf_inputs["pixel_values"])
+                 hf_text_embeds = hf_model.model.get_text_features(
+                    input_ids=hf_inputs["input_ids"],
+                    attention_mask=hf_inputs["attention_mask"])
+                 hf_outputs = (hf_image_embeds.cpu().tolist() + 
+                               hf_text_embeds.cpu().tolist())
+            elif input_images:
+                # Image-only
+                hf_outputs_tensor = hf_model.model.get_image_features(
+                    pixel_values=hf_inputs["pixel_values"])
+                hf_outputs = hf_outputs_tensor.cpu().tolist()
+            else:
+                # Text-only
+                hf_outputs_tensor = hf_model.model.get_text_features(
+                    input_ids=hf_inputs["input_ids"],
+                    attention_mask=hf_inputs["attention_mask"])
+                hf_outputs = hf_outputs_tensor.cpu().tolist()
 
-    outputs = llm.encode(inputs)
-
-    all_embeddings = []
-    for output in outputs:
-        squeezed_data = output.outputs.data.squeeze(1)
-        all_embeddings.extend(squeezed_data.tolist())
-
-    return all_embeddings
+    check_embeddings_close(
+        embeddings_0_lst=hf_outputs,
+        embeddings_1_lst=vllm_outputs,
+        name_0="hf",
+        name_1="vllm",
+    )
 
 
 @pytest.mark.parametrize("model", [MODEL])
 @pytest.mark.parametrize("dtype", ["half"])
-def test_siglip_so400m_model_functionality(
+def test_text_embeddings(
+    hf_runner: type[HfRunner],
+    vllm_runner: type[VllmRunner],
+    model: str,
+    dtype: str,
+) -> None:
+    """Test text embeddings against Hugging Face."""
+    input_texts = [
+        "a photo of a stop sign",
+        "a photo of a cherry blossom",
+    ]
+
+    _run_test(hf_runner,
+              vllm_runner,
+              model,
+              dtype,
+              input_texts=input_texts,
+              input_images=[])
+
+
+@pytest.mark.parametrize("model", [MODEL])
+@pytest.mark.parametrize("dtype", ["half"])
+def test_image_embeddings(
+    hf_runner: type[HfRunner],
+    vllm_runner: type[VllmRunner],
+    image_assets,
+    model: str,
+    dtype: str,
+) -> None:
+    """Test image embeddings against Hugging Face."""
+    assets_by_name = {asset.name: asset for asset in image_assets}
+    stop_sign_image = assets_by_name["stop_sign"].pil_image
+
+    _run_test(
+        hf_runner,
+        vllm_runner,
+        model,
+        dtype,
+        input_texts=[""],
+        input_images=[stop_sign_image],
+    )
+
+
+@pytest.mark.parametrize("model", [MODEL])
+@pytest.mark.parametrize("dtype", ["half"])
+def test_relative_similarity(
     vllm_runner: type[VllmRunner],
     image_assets,
     model: str,
     dtype: str,
 ) -> None:
     """
-    The core functionality of the SiglipSo400m model
-    is tested by verifying the relative scores of image and text matching.
+    Test that the relative similarity between image and text embeddings
+    is logical.
     """
-    set_random_seed(0)
-
     assets_by_name = {asset.name: asset for asset in image_assets}
-    image = assets_by_name["stop_sign"].pil_image
+    stop_sign_image = assets_by_name["stop_sign"].pil_image
     correct_text = "a photo of a stop sign"
     incorrect_text = "a photo of a cherry blossom"
 
     with vllm_runner(model,
+                     runner="pooling",
                      dtype=dtype,
                      enforce_eager=True,
                      trust_remote_code=True,
@@ -74,24 +141,20 @@ def test_siglip_so400m_model_functionality(
                      tokenizer_name=TOKENIZER_ID,
                      gpu_memory_utilization=0.8) as vllm_model:
 
-        vllm_text_embeds_list = encode_multimodal(
-            llm=vllm_model.llm,
-            prompts=[correct_text, incorrect_text],
-            images=None)
+        image_embed = torch.tensor(vllm_model.embed([], [stop_sign_image])[0])
+        text_embeds = torch.tensor(
+            vllm_model.embed([correct_text, incorrect_text]))
 
-        vllm_image_embeds_list = encode_multimodal(llm=vllm_model.llm,
-                                                   prompts=[None],
-                                                   images=[image])
+        correct_text_embed = text_embeds[0]
+        incorrect_text_embed = text_embeds[1]
 
-        image_embed = torch.tensor(vllm_image_embeds_list[0])
-        correct_text_embed = torch.tensor(vllm_text_embeds_list[0])
-        incorrect_text_embed = torch.tensor(vllm_text_embeds_list[1])
         sim_correct = F.cosine_similarity(image_embed,
                                           correct_text_embed,
                                           dim=0)
         sim_incorrect = F.cosine_similarity(image_embed,
                                             incorrect_text_embed,
                                             dim=0)
+
         assert sim_correct > sim_incorrect, (
             "Model failed the sanity check: "
             "Correct text should have higher similarity than incorrect text. "
